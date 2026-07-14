@@ -5899,7 +5899,7 @@ late MqttServerClient mqttClient;
 // instead of committing it:
 //   final uri = Platform.environment['MONGO_URI'] ?? _mongoUri;
 const String _mongoUri =
-    'mongodb+srv://Railway:Erode@cluster0.uxm1j2y.mongodb.net/Railway';
+    'mongodb+srv://Railway:Erode@cluster0.uxm1j2y.mongodb.net/Railway?retryWrites=true&w=majority';
 
 Future<Db> _openConnection() async {
   while (true) {
