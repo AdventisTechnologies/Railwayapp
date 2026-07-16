@@ -5878,6 +5878,682 @@
 
 
 
+// import 'dart:async';
+// import 'dart:convert';
+// import 'package:mongo_dart/mongo_dart.dart';
+// import 'package:shelf/shelf.dart';
+// import 'package:shelf/shelf_io.dart' as io;
+// import 'package:shelf_router/shelf_router.dart';
+// import 'package:shelf_cors_headers/shelf_cors_headers.dart';
+// import 'package:mqtt_client/mqtt_server_client.dart';
+// import 'package:mqtt_client/mqtt_client.dart';
+
+// late Db db;
+// late MqttServerClient mqttClient;
+
+// // ==========================================
+// // 1. DATABASE CONNECTIVITY (MongoDB Atlas)
+// // ==========================================
+// // SECURITY NOTE: rotate this password in Atlas ("Database Access" -> edit
+// // user -> new password) and load the URI from an environment variable
+// // instead of committing it:
+// //   final uri = Platform.environment['MONGO_URI'] ?? _mongoUri;
+// const String _mongoUri =
+//     'mongodb+srv://Railway:Erode@cluster0.uxm1j2y.mongodb.net/Railway?retryWrites=true&w=majority';
+
+// Future<Db> _openConnection() async {
+//   while (true) {
+//     try {
+//       final database = await Db.create(_mongoUri);
+//       await database.open();
+//       return database;
+//     } catch (e) {
+//       print("DB connection failed, retrying in 3s: $e");
+//       print("  (If this persists, check your internet connection and the cluster status on the Atlas dashboard.)");
+//       await Future.delayed(const Duration(seconds: 3));
+//     }
+//   }
+// }
+
+// Future<void> connectDB() async {
+//   db = await _openConnection();
+//   print("Connected to MongoDB (database: ${db.databaseName})");
+// }
+
+// // ------------------------------------------
+// // RECONNECT GUARD
+// // ------------------------------------------
+// // FIX: previously every failing query independently called
+// // `db = await _openConnection()`. Under concurrent load, multiple requests
+// // failing at the same instant each raced to open their OWN new connection,
+// // stomping over `db` mid-reconnect and immediately hitting the dead socket
+// // again -> the "Broken pipe" / "No master connection" burst seen in the
+// // logs. Now there is at most ONE reconnect in flight at a time; anyone else
+// // who fails while it's happening just awaits the SAME future instead of
+// // starting another one.
+// Future<Db>? _reconnectFuture;
+
+// Future<Db> _reconnect() {
+//   final inFlight = _reconnectFuture;
+//   if (inFlight != null) return inFlight;
+
+//   final future = _openConnection().then((newDb) {
+//     db = newDb;
+//     print("Reconnected to MongoDB.");
+//     _reconnectFuture = null;
+//     return newDb;
+//   }).catchError((e) {
+//     _reconnectFuture = null;
+//     throw e;
+//   });
+
+//   _reconnectFuture = future;
+//   return future;
+// }
+
+// // Runs a query; retries through a shared reconnect with backoff instead of
+// // giving up after a single attempt, since a reconnect storm (many requests
+// // failing at once) previously meant the "one retry" often landed on a
+// // connection that hadn't stabilized yet.
+// Future<T> _withRetry<T>(Future<T> Function() action, {int maxAttempts = 3}) async {
+//   var attempt = 0;
+//   while (true) {
+//     try {
+//       return await action();
+//     } catch (e) {
+//       attempt++; 
+//       if (attempt >= maxAttempts) {
+//         print("Query failed after $attempt attempts ($e). Giving up.");
+//         rethrow;
+//       }
+//       print("Query failed ($e). Reconnecting to MongoDB and retrying (attempt $attempt)...");
+//       await _reconnect();
+//       await Future.delayed(Duration(milliseconds: 300 * attempt));
+//     }
+//   }
+// }
+
+// // ------------------------------------------
+// // KEEPALIVE
+// // ------------------------------------------
+// // Atlas / the hosting network can silently close an idle socket. Pinging
+// // periodically keeps the connection warm so the FIRST real request after a
+// // quiet period doesn't discover a dead socket. If the ping itself fails,
+// // that's a signal to proactively reconnect rather than waiting for a user
+// // request to trip over it.
+// Timer? _keepAliveTimer;
+
+// void _startKeepAlive() {
+//   _keepAliveTimer?.cancel();
+//   _keepAliveTimer = Timer.periodic(const Duration(seconds: 20), (_) async {
+//     try {
+//       await db.serverStatus();
+//     } catch (e) {
+//       print("Keepalive ping failed ($e), reconnecting...");
+//       try {
+//         await _reconnect();
+//       } catch (e2) {
+//         print("Keepalive reconnect attempt failed: $e2");
+//       }
+//     }
+//   });
+// }
+
+// // ==========================================
+// // 2. MQTT CLIENT PUBLISHER
+// // ==========================================
+// Future<void> connectMQTT() async {
+//   mqttClient = MqttServerClient('broker.hivemq.com', 'mongo_notify_bridge');
+//   mqttClient.port = 1883;
+//   mqttClient.logging(on: false);
+//   mqttClient.keepAlivePeriod = 20;
+//   mqttClient.connectTimeoutPeriod = 8000;
+
+//   try {
+//     print('Connecting to MQTT Broker...');
+//     await mqttClient.connect();
+//     print('Connected to MQTT Broker successfully!');
+//   } catch (e) {
+//     print('MQTT Connection failure: $e');
+//     mqttClient.disconnect();
+//   }
+// }
+
+// // ==========================================
+// // 3. MONGODB CHANGE STREAM -> MQTT BRIDGE WORKER
+// // ==========================================
+// Future<void> startMongoChangeStreamBridge() async {
+//   final collection = db.collection('machine_sensor_data');
+//   final stream = collection.watch(
+//     <Map<String, Object>>[],
+//     changeStreamOptions: ChangeStreamOptions(fullDocument: 'updateLookup'),
+//   );
+
+//   print("MongoDB change stream actively watching collection: machine_sensor_data");
+
+//   stream.listen((event) {
+//     final doc = event.fullDocument;
+//     if (doc == null) return;
+
+//     final payload = jsonEncode(_sensorRowToJson(doc));
+//     print("\n[DB CHANGE RECEIVER] New/changed document detected! Payload: $payload");
+
+//     if (mqttClient.connectionStatus!.state == MqttConnectionState.connected) {
+//       final builder = MqttClientPayloadBuilder();
+//       builder.addString(payload);
+
+//       mqttClient.publishMessage('machine/metrics', MqttQos.atLeastOnce, builder.payload!);
+//       print("[MQTT BRIDGE] Successfully forwarded notification data to topic: machine/metrics");
+//     } else {
+//       print("[MQTT BRIDGE ERROR] MQTT Client offline, unable to bridge broadcast.");
+//     }
+//   }, onError: (e) {
+//     print("[MQTT BRIDGE ERROR] Change stream error: $e");
+//   });
+// }
+
+// // ==========================================
+// // 4. BUSINESS LOGIC DATABASE QUERIES
+// // ==========================================
+// Future<Map<String, dynamic>> loginUser(String username, String password) async {
+//   final row = await _withRetry(
+//     () => db.collection('Users').findOne(where.eq('username', username.trim())),
+//   );
+
+//   if (row != null) {
+//     final dbPassword = row['password']?.toString() ?? '';
+
+//     if (dbPassword == password) {
+//       return {"success": true, "message": "Login successful", "username": username};
+//     }
+//   }
+//   return {"success": false, "message": "Invalid username or password"};
+// }
+
+// // ------------------------------------------
+// // COLLECTION: machine_sensor_data
+// // ------------------------------------------
+// DateTime? _timestampFromObjectId(ObjectId id) {
+//   try {
+//     final hex = id.oid;
+//     final seconds = int.parse(hex.substring(0, 8), radix: 16);
+//     return DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true);
+//   } catch (_) {
+//     return null;
+//   }
+// }
+
+// DateTime? _sensorTimestamp(Map<String, dynamic> row) {
+//   final explicit = _asDateTime(row['createdAt']);
+//   if (explicit != null) return explicit;
+
+//   final id = row['_id'];
+//   if (id is ObjectId) return _timestampFromObjectId(id);
+
+//   return null;
+// }
+
+// Map<String, dynamic> _sensorRowToJson(Map<String, dynamic> row) {
+//   return {
+//     "id": (row["_id"] is ObjectId) ? (row["_id"] as ObjectId).oid : row["_id"]?.toString(),
+//     "amb_temp": row["amb_temp"],
+//     "tm1_fet": row["tm1_fet"],
+//     "tm1_ret": row["tm1_ret"],
+//     "tm2_fet": row["tm2_fet"],
+//     "tm2_ret": row["tm2_ret"],
+//     "created_at": _sensorTimestamp(row)?.toIso8601String(),
+//   };
+// }
+
+// Future<List<Map<String, dynamic>>> fetchSensorDataFromDB() async {
+//   final rows = await _withRetry(
+//     () => db.collection('machine_sensor_data').find(where.sortBy('_id')).toList(),
+//   );
+
+//   return rows.map(_sensorRowToJson).toList();
+// }
+
+// // ------------------------------------------
+// // COLLECTION: vfddatas
+// // ------------------------------------------
+// Map<String, dynamic> _vfdRowToJson(Map<String, dynamic> row) {
+//   return {
+//     "id": (row["_id"] is ObjectId) ? (row["_id"] as ObjectId).oid : row["_id"]?.toString(),
+//     "machineId": row["machineId"]?.toString(),
+//     "outputCurrent": row["outputCurrent"],
+//     "outputVoltage": row["outputVoltage"],
+//     "outputRPM": row["outputRPM"],
+//     "outputFrequency": row["outputFrequency"],
+//     "outputPower": row["outputPower"],
+//     "created_at": (_asDateTime(row["createdAt"]) ??
+//             (row["_id"] is ObjectId ? _timestampFromObjectId(row["_id"] as ObjectId) : null))
+//         ?.toIso8601String(),
+//   };
+// }
+
+// Future<List<Map<String, dynamic>>> fetchVfdDataFromDB() async {
+//   final rows = await _withRetry(
+//     () => db.collection('vfddatas').find(where.sortBy('_id')).toList(),
+//   );
+
+//   return rows.map(_vfdRowToJson).toList();
+// }
+
+// // ------------------------------------------
+// // SESSION SCOPING
+// // ------------------------------------------
+// DateTime? _asDateTime(dynamic v) {
+//   if (v == null) return null;
+//   if (v is DateTime) return v;
+//   return DateTime.tryParse(v.toString());
+// }
+
+// Future<List<Map<String, dynamic>>> fetchMachineSessionsFromDB() async {
+//   final rows = await _withRetry(
+//     () => db.collection('machine_data').find(where.sortBy('created_at', descending: true)).toList(),
+//   );
+
+//   final seen = <String, Map<String, dynamic>>{};
+//   for (final row in rows) {
+//     final motorType = row['motor_type']?.toString() ?? '';
+//     final testId = row['test_id']?.toString() ?? '';
+//     if (motorType.isEmpty || testId.isEmpty) continue;
+//     final key = '$motorType\u0000$testId';
+//     seen.putIfAbsent(key, () => {
+//           "motor_type": motorType,
+//           "test_id": testId,
+//           "last_status": row['status'],
+//           "is_active": row['status'] == 1,
+//           "last_activity": _asDateTime(row['created_at'])?.toIso8601String(),
+//         });
+//   }
+//   return seen.values.toList();
+// }
+
+// Future<Map<String, dynamic>> fetchSessionSensorData(String motorType, String testId) async {
+//   final sessionDocs = await _withRetry(
+//     () => db
+//         .collection('machine_data')
+//         .find(where.eq('motor_type', motorType).eq('test_id', testId).sortBy('created_at', descending: true))
+//         .toList(),
+//   );
+
+//   Map<String, dynamic>? startDoc;
+//   for (final d in sessionDocs) {
+//     if (d['status'] == 1) {
+//       startDoc = d;
+//       break;
+//     }
+//   }
+//   if (startDoc == null) {
+//     return {"found": false, "motor_type": motorType, "test_id": testId};
+//   }
+//   final startTime = _asDateTime(startDoc['created_at']);
+
+//   DateTime? stopTime;
+//   for (final d in sessionDocs.reversed) {
+//     if (d['status'] == 0) {
+//       final t = _asDateTime(d['created_at']);
+//       if (t != null && startTime != null && t.isAfter(startTime)) {
+//         stopTime = t;
+//         break;
+//       }
+//     }
+//   }
+
+//   final allSensorRows = await _withRetry(
+//     () => db.collection('machine_sensor_data').find().toList(),
+//   );
+
+//   allSensorRows.sort((a, b) {
+//     final ta = _sensorTimestamp(a);
+//     final tb = _sensorTimestamp(b);
+//     if (ta == null && tb == null) return 0;
+//     if (ta == null) return -1;
+//     if (tb == null) return 1;
+//     return ta.compareTo(tb);
+//   });
+
+//   final windowed = allSensorRows.where((row) {
+//     final t = _sensorTimestamp(row);
+//     if (t == null) return false;
+//     if (startTime != null && t.isBefore(startTime)) return false;
+//     if (stopTime != null && t.isAfter(stopTime)) return false;
+//     return true;
+//   }).map(_sensorRowToJson).toList();
+
+//   return {
+//     "found": true,
+//     "motor_type": motorType,
+//     "test_id": testId,
+//     "start_time": startTime?.toIso8601String(),
+//     "stop_time": stopTime?.toIso8601String(),
+//     "is_active": stopTime == null,
+//     "sensor_data": windowed,
+//   };
+// }
+
+// Future<Map<String, dynamic>> fetchSensorDataInRange(DateTime from, DateTime to) async {
+//   final machineRows = await _withRetry(
+//     () => db.collection('machine_data').find(where.sortBy('created_at')).toList(),
+//   );
+
+//   final openStarts = <String, Map<String, dynamic>>{};
+//   final sessions = <Map<String, dynamic>>[];
+
+//   for (final row in machineRows) {
+//     final motorType = row['motor_type']?.toString() ?? '';
+//     final testId = row['test_id']?.toString() ?? '';
+//     if (motorType.isEmpty || testId.isEmpty) continue;
+//     final key = '$motorType\u0000$testId';
+//     final status = row['status'];
+
+//     if (status == 1) {
+//       openStarts[key] = row;
+//     } else if (status == 0) {
+//       final start = openStarts.remove(key);
+//       if (start != null) {
+//         sessions.add({
+//           "motor_type": motorType,
+//           "test_id": testId,
+//           "machine_id": start["machine_id"],
+//           "operation_name": start["operation_name"],
+//           "start_time": _asDateTime(start["created_at"]),
+//           "stop_time": _asDateTime(row["created_at"]),
+//         });
+//       }
+//     }
+//   }
+//   for (final start in openStarts.values) {
+//     sessions.add({
+//       "motor_type": start["motor_type"],
+//       "test_id": start["test_id"],
+//       "machine_id": start["machine_id"],
+//       "operation_name": start["operation_name"],
+//       "start_time": _asDateTime(start["created_at"]),
+//       "stop_time": null,
+//     });
+//   }
+
+//   final matched = sessions.where((s) {
+//     final st = s["start_time"] as DateTime?;
+//     if (st == null) return false;
+//     return !st.isBefore(from) && !st.isAfter(to);
+//   }).toList()
+//     ..sort((a, b) => (a["start_time"] as DateTime).compareTo(b["start_time"] as DateTime));
+
+//   final allSensorRows = await _withRetry(() => db.collection('machine_sensor_data').find().toList());
+//   allSensorRows.sort((a, b) {
+//     final ta = _sensorTimestamp(a);
+//     final tb = _sensorTimestamp(b);
+//     if (ta == null && tb == null) return 0;
+//     if (ta == null) return -1;
+//     if (tb == null) return 1;
+//     return ta.compareTo(tb);
+//   });
+
+//   final combined = <Map<String, dynamic>>[];
+//   final seenIds = <String>{};
+//   for (final session in matched) {
+//     final st = session["start_time"] as DateTime?;
+//     final sp = session["stop_time"] as DateTime?;
+//     for (final row in allSensorRows) {
+//       final t = _sensorTimestamp(row);
+//       if (t == null) continue;
+//       if (st != null && t.isBefore(st)) continue;
+//       if (sp != null && t.isAfter(sp)) continue;
+//       final json = _sensorRowToJson(row);
+//       final id = json["id"]?.toString() ?? '';
+//       if (id.isNotEmpty && !seenIds.add(id)) continue;
+//       combined.add(json);
+//     }
+//   }
+//   combined.sort((a, b) {
+//     final ta = DateTime.tryParse(a["created_at"]?.toString() ?? '');
+//     final tb = DateTime.tryParse(b["created_at"]?.toString() ?? '');
+//     if (ta == null && tb == null) return 0;
+//     if (ta == null) return -1;
+//     if (tb == null) return 1;
+//     return ta.compareTo(tb);
+//   });
+
+//   return {
+//     "from": from.toIso8601String(),
+//     "to": to.toIso8601String(),
+//     "sessions": matched
+//         .map((s) => {
+//               "motor_type": s["motor_type"],
+//               "test_id": s["test_id"],
+//               "machine_id": s["machine_id"],
+//               "operation_name": s["operation_name"],
+//               "start_time": (s["start_time"] as DateTime?)?.toIso8601String(),
+//               "stop_time": (s["stop_time"] as DateTime?)?.toIso8601String(),
+//               "is_active": s["stop_time"] == null,
+//             })
+//         .toList(),
+//     "sensor_data": combined,
+//   };
+// }
+
+// // ------------------------------------------
+// // SEPARATE COLLECTION: machine_data
+// // ------------------------------------------
+// Future<Map<String, dynamic>> insertMachineRecord(
+//   String motorType, String machineId, String testId, String operationName, String field1, String field2, String field3, int status
+// ) async {
+//   final doc = {
+//     "motor_type": motorType,
+//     "machine_id": machineId,
+//     "test_id": testId,
+//     "operation_name": operationName,
+//     "field_1": field1,
+//     "field_2": field2,
+//     "field_3": field3,
+//     "status": status,
+//     "created_at": DateTime.now().toUtc(),
+//   };
+
+//   final result = await _withRetry(() => db.collection('machine_data').insertOne(doc));
+
+//   if (!result.isSuccess) {
+//     print("[INSERT FAILED] machine_data insert did not succeed: $result");
+//     throw Exception('Database did not confirm the write (isSuccess=false) — nothing was saved.');
+//   }
+
+//   final insertedId = (result.id is ObjectId) ? (result.id as ObjectId).oid : result.id?.toString();
+//   print("[INSERT OK] machine_data id=$insertedId motor_type=$motorType test_id=$testId status=$status");
+
+//   return {
+//     "success": true,
+//     "record": {
+//       "id": insertedId,
+//       ...doc,
+//       "created_at": doc["created_at"].toString(),
+//     },
+//   };
+// }
+
+// Future<List<Map<String, dynamic>>> fetchMachineRecordsFromDB() async {
+//   final rows = await _withRetry(
+//     () => db.collection('machine_data').find(where.sortBy('_id')).toList(),
+//   );
+
+//   return rows.map((row) {
+//     return {
+//       "id": (row["_id"] is ObjectId) ? (row["_id"] as ObjectId).oid : row["_id"]?.toString(),
+//       "motor_type": row["motor_type"],
+//       "machine_id": row["machine_id"],
+//       "test_id": row["test_id"],
+//       "operation_name": row["operation_name"],
+//       "field_1": row["field_1"],
+//       "field_2": row["field_2"],
+//       "field_3": row["field_3"],
+//       "status": row["status"],
+//       "created_at": row["created_at"]?.toString(),
+//     };
+//   }).toList();
+// }
+
+// // ==========================================
+// // 5. MAIN SERVICE DRIVER Entrypoint
+// // ==========================================
+// Future<void> main() async {
+//   await connectDB();
+//   _startKeepAlive();
+
+//   final router = Router();
+
+//   router.post('/login', (Request request) async {
+//     try {
+//       final body = jsonDecode(await request.readAsString());
+//       String username = body['username']?.toString() ?? '';
+//       String password = body['password']?.toString() ?? '';
+
+//       if (username.isEmpty || password.isEmpty) {
+//         return Response(400, body: jsonEncode({"message": "Username/Password required"}), headers: {"Content-Type": "application/json"});
+//       }
+
+//       final result = await loginUser(username, password);
+//       return Response(result["success"] ? 200 : 401, body: jsonEncode(result), headers: {"Content-Type": "application/json"});
+//     } catch (e) {
+//       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
+//     }
+//   });
+
+//   router.get('/get-sensor-data', (Request request) async {
+//     try {
+//       final logs = await fetchSensorDataFromDB();
+//       return Response.ok(jsonEncode(logs), headers: {"Content-Type": "application/json"});
+//     } catch (e) {
+//       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
+//     }
+//   });
+
+//   router.get('/get-vfd-data', (Request request) async {
+//     try {
+//       final logs = await fetchVfdDataFromDB();
+//       return Response.ok(jsonEncode(logs), headers: {"Content-Type": "application/json"});
+//     } catch (e) {
+//       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
+//     }
+//   });
+
+//   router.post('/add-machine-record', (Request request) async {
+//     try {
+//       final body = jsonDecode(await request.readAsString());
+
+//       String motorType = body['motor_type']?.toString() ?? '';
+//       String machineId = body['machine_id']?.toString() ?? '';
+//       String testId = body['test_id']?.toString() ?? '';
+//       String operationName = body['operation_name']?.toString() ?? '';
+//       String field1 = body['field_1']?.toString() ?? '';
+//       String field2 = body['field_2']?.toString() ?? '';
+//       String field3 = body['field_3']?.toString() ?? '';
+//       int status = int.tryParse(body['status']?.toString() ?? '') ?? 1;
+
+//       if (motorType.isEmpty || machineId.isEmpty || testId.isEmpty || operationName.isEmpty || field1.isEmpty || field2.isEmpty || field3.isEmpty) {
+//         return Response(400, body: jsonEncode({"message": "All fields are required"}), headers: {"Content-Type": "application/json"});
+//       }
+
+//       final result = await insertMachineRecord(motorType, machineId, testId, operationName, field1, field2, field3, status);
+
+//       final success = result["success"] == true;
+//       return Response(
+//         success ? 201 : 500,
+//         body: jsonEncode(result),
+//         headers: {"Content-Type": "application/json"},
+//       );
+//     } catch (e) {
+//       print("[/add-machine-record] Insert failed: $e");
+//       return Response.internalServerError(
+//         body: jsonEncode({"success": false, "message": e.toString()}),
+//         headers: {"Content-Type": "application/json"},
+//       );
+//     }
+//   });
+
+//   router.get('/get-machine-records', (Request request) async {
+//     try {
+//       final logs = await fetchMachineRecordsFromDB();
+//       return Response.ok(jsonEncode(logs), headers: {"Content-Type": "application/json"});
+//     } catch (e) {
+//       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
+//     }
+//   });
+
+//   router.get('/get-machine-sessions', (Request request) async {
+//     try {
+//       final sessions = await fetchMachineSessionsFromDB();
+//       return Response.ok(jsonEncode(sessions), headers: {"Content-Type": "application/json"});
+//     } catch (e) {
+//       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
+//     }
+//   });
+
+//   router.get('/get-session-sensor-data', (Request request) async {
+//     try {
+//       final motorType = request.url.queryParameters['motor_type'] ?? '';
+//       final testId = request.url.queryParameters['test_id'] ?? '';
+
+//       if (motorType.isEmpty || testId.isEmpty) {
+//         return Response(400, body: jsonEncode({"message": "motor_type and test_id are required"}), headers: {"Content-Type": "application/json"});
+//       }
+
+//       final result = await fetchSessionSensorData(motorType, testId);
+//       return Response.ok(jsonEncode(result), headers: {"Content-Type": "application/json"});
+//     } catch (e) {
+//       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
+//     }
+//   });
+
+//   router.get('/get-sensor-data-range', (Request request) async {
+//     try {
+//       final fromStr = request.url.queryParameters['from'] ?? '';
+//       final toStr = request.url.queryParameters['to'] ?? '';
+//       if (fromStr.isEmpty || toStr.isEmpty) {
+//         return Response(400, body: jsonEncode({"message": "from and to (YYYY-MM-DD) are required"}), headers: {"Content-Type": "application/json"});
+//       }
+
+//       DateTime parseDay(String s, {required bool endOfDay}) {
+//         final parts = s.split('-').map(int.parse).toList();
+//         return endOfDay
+//             ? DateTime.utc(parts[0], parts[1], parts[2], 23, 59, 59, 999)
+//             : DateTime.utc(parts[0], parts[1], parts[2]);
+//       }
+
+//       final from = parseDay(fromStr, endOfDay: false);
+//       final to = parseDay(toStr, endOfDay: true);
+
+//       final result = await fetchSensorDataInRange(from, to);
+//       return Response.ok(jsonEncode(result), headers: {"Content-Type": "application/json"});
+//     } catch (e) {
+//       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
+//     }
+//   });
+
+//   final handler = Pipeline().addMiddleware(corsHeaders()).addMiddleware(logRequests()).addHandler(router.call);
+//   await io.serve(handler, '0.0.0.0', 3000);
+//   print("Server engine operational on http://MongoDB:3000");
+
+//   unawaited(_startRealtimeBridgeInBackground());
+// }
+
+// Future<void> _startRealtimeBridgeInBackground() async {
+//   try {
+//     await connectMQTT();
+//     if (mqttClient.connectionStatus!.state == MqttConnectionState.connected) {
+//       await startMongoChangeStreamBridge();
+//     } else {
+//       print("Skipping Mongo->MQTT bridge — MQTT broker unreachable right now.");
+//     }
+//   } catch (e) {
+//     print("Realtime bridge failed to start (non-fatal, login/dashboard unaffected): $e");
+//   }
+// }
+
+
+
+
 import 'dart:async';
 import 'dart:convert';
 import 'package:mongo_dart/mongo_dart.dart';
@@ -6093,14 +6769,36 @@ DateTime? _sensorTimestamp(Map<String, dynamic> row) {
   return null;
 }
 
+// Coerces any BSON numeric type (Decimal128, Int64, etc.) that dart:convert's
+// jsonEncode can't serialize natively into a plain JSON-safe num. This is
+// what was causing /get-sensor-data and /get-vfd-data to 500: those two
+// routes previously passed raw Mongo field values straight into jsonEncode,
+// and any document containing one of these types made the WHOLE request
+// throw inside jsonEncode (caught by the route's try/catch as a 500), even
+// though every other field in the document was fine.
+dynamic _jsonSafe(dynamic v) {
+  if (v == null) return null;
+  if (v is num || v is String || v is bool) return v;
+  // mongo_dart's Decimal128 / Int64 / similar all expose a usable toString()
+  // or toDouble()/toInt(); try the numeric route first, fall back to string.
+  try {
+    final asString = v.toString();
+    final asNum = num.tryParse(asString);
+    if (asNum != null) return asNum;
+    return asString;
+  } catch (_) {
+    return v.toString();
+  }
+}
+
 Map<String, dynamic> _sensorRowToJson(Map<String, dynamic> row) {
   return {
     "id": (row["_id"] is ObjectId) ? (row["_id"] as ObjectId).oid : row["_id"]?.toString(),
-    "amb_temp": row["amb_temp"],
-    "tm1_fet": row["tm1_fet"],
-    "tm1_ret": row["tm1_ret"],
-    "tm2_fet": row["tm2_fet"],
-    "tm2_ret": row["tm2_ret"],
+    "amb_temp": _jsonSafe(row["amb_temp"]),
+    "tm1_fet": _jsonSafe(row["tm1_fet"]),
+    "tm1_ret": _jsonSafe(row["tm1_ret"]),
+    "tm2_fet": _jsonSafe(row["tm2_fet"]),
+    "tm2_ret": _jsonSafe(row["tm2_ret"]),
     "created_at": _sensorTimestamp(row)?.toIso8601String(),
   };
 }
@@ -6120,11 +6818,11 @@ Map<String, dynamic> _vfdRowToJson(Map<String, dynamic> row) {
   return {
     "id": (row["_id"] is ObjectId) ? (row["_id"] as ObjectId).oid : row["_id"]?.toString(),
     "machineId": row["machineId"]?.toString(),
-    "outputCurrent": row["outputCurrent"],
-    "outputVoltage": row["outputVoltage"],
-    "outputRPM": row["outputRPM"],
-    "outputFrequency": row["outputFrequency"],
-    "outputPower": row["outputPower"],
+    "outputCurrent": _jsonSafe(row["outputCurrent"]),
+    "outputVoltage": _jsonSafe(row["outputVoltage"]),
+    "outputRPM": _jsonSafe(row["outputRPM"]),
+    "outputFrequency": _jsonSafe(row["outputFrequency"]),
+    "outputPower": _jsonSafe(row["outputPower"]),
     "created_at": (_asDateTime(row["createdAt"]) ??
             (row["_id"] is ObjectId ? _timestampFromObjectId(row["_id"] as ObjectId) : null))
         ?.toIso8601String(),
@@ -6395,7 +7093,262 @@ Future<List<Map<String, dynamic>>> fetchMachineRecordsFromDB() async {
 }
 
 // ==========================================
-// 5. MAIN SERVICE DRIVER Entrypoint
+// 5. MACHINE STABILITY ANALYSIS
+// ------------------------------------------
+// Dart port of the reference Node/Express `getMachineAnalysis` controller.
+// For every (machine_id, test_id) Start(1)->Stop(0) session that started
+// inside [from, to], and for each of the 4 TM1/TM2 Drive/Non-Drive-End
+// sensor fields: ambient temp, final temp, temp rise, and a 5-min /
+// 15-min / 1-hour "Motor Declared Stable/Unstable" verdict — all three
+// verdicts compare the SAME last-hour temperature change (nearest reading
+// to `offTime - 1h` vs nearest reading to `offTime`) against that
+// window's own threshold, exactly like the reference controller.
+// ==========================================
+const List<Map<String, Object>> _analysisIntervals = [
+  {"key": "fiveMinute", "minutes": 5, "limit": 0.5},
+  {"key": "fifteenMinute", "minutes": 15, "limit": 0.5},
+  {"key": "oneHour", "minutes": 60, "limit": 1.0},
+];
+
+const List<Map<String, String>> _analysisFields = [
+  {"key": "tm1_fet", "name": "TM1 Drive End"},
+  {"key": "tm1_ret", "name": "TM1 Non Drive End"},
+  {"key": "tm2_fet", "name": "TM2 Drive End"},
+  {"key": "tm2_ret", "name": "TM2 Non Drive End"},
+];
+
+double _analysisNum(dynamic v) {
+  if (v == null) return 0;
+  if (v is num) return v.toDouble();
+  return double.tryParse(v.toString()) ?? 0;
+}
+
+// Mirrors getNearestRecord(): the record whose timestamp sits closest to
+// targetTime (absolute difference), via linear scan.
+Map<String, dynamic>? _nearestSensorRecord(List<Map<String, dynamic>> records, DateTime targetTime) {
+  if (records.isEmpty) return null;
+  var nearest = records.first;
+  var minDiff = (_sensorTimestamp(nearest) ?? targetTime).difference(targetTime).abs();
+  for (final rec in records) {
+    final t = _sensorTimestamp(rec);
+    if (t == null) continue;
+    final diff = t.difference(targetTime).abs();
+    if (diff < minDiff) {
+      minDiff = diff;
+      nearest = rec;
+    }
+  }
+  return nearest;
+}
+
+// Mirrors generateIntervalData(): walk on->off in N-minute steps, snapped
+// to the clock (e.g. :00/:05/:10 for a 5-minute interval), picking the
+// nearest actual reading at each step. Feeds the `readings` list in the
+// report only — NOT the stability verdict (see fetchMachineAnalysisInRange).
+List<Map<String, dynamic>> _generateAnalysisIntervalData(
+  List<Map<String, dynamic>> records,
+  DateTime startTime,
+  DateTime endTime,
+  int intervalMinutes,
+) {
+  final output = <Map<String, dynamic>>[];
+
+  var current = DateTime(startTime.year, startTime.month, startTime.day, startTime.hour, startTime.minute);
+  current = current.subtract(Duration(minutes: current.minute % intervalMinutes));
+
+  while (current.isBefore(startTime)) {
+    current = current.add(Duration(minutes: intervalMinutes));
+  }
+
+  while (!current.isAfter(endTime)) {
+    final record = _nearestSensorRecord(records, current);
+    if (record != null) output.add(record);
+    current = current.add(Duration(minutes: intervalMinutes));
+  }
+
+  return output;
+}
+
+// Mirrors getRunDuration(): "H:MM" between two timestamps.
+String _analysisRunDuration(DateTime onTime, DateTime offTime) {
+  final diff = offTime.difference(onTime);
+  final hrs = diff.inHours;
+  final mins = diff.inMinutes % 60;
+  return '$hrs:${mins.toString().padLeft(2, '0')}';
+}
+
+// Mirrors getMotorStatus().
+String _analysisMotorStatus(double diff, double limit) =>
+    diff > limit ? 'Motor Declared Unstable' : 'Motor Declared Stable';
+
+Map<String, dynamic> _incompleteIntervalReport(double limit) => {
+      "firstTemperature": 0,
+      "lastTemperature": 0,
+      "temperatureRiseLastOneHour": 0,
+      "threshold": limit,
+      "status": "Process Incomplete - Required sensor data not received from the device.",
+      "readings": <Map<String, dynamic>>[],
+    };
+
+Future<List<Map<String, dynamic>>> fetchMachineAnalysisInRange(DateTime from, DateTime to) async {
+  // Same "fetch everything once, filter/group in memory" approach as
+  // fetchSensorDataInRange, since machine_data/machine_sensor_data rows
+  // aren't guaranteed a reliable indexed timestamp field to range-query on.
+  final machineRows = await _withRetry(
+    () => db.collection('machine_data').find(where.sortBy('created_at')).toList(),
+  );
+
+  final allSensorRows = await _withRetry(() => db.collection('machine_sensor_data').find().toList());
+  allSensorRows.sort((a, b) {
+    final ta = _sensorTimestamp(a);
+    final tb = _sensorTimestamp(b);
+    if (ta == null && tb == null) return 0;
+    if (ta == null) return -1;
+    if (tb == null) return 1;
+    return ta.compareTo(tb);
+  });
+
+  // Group machine records by machine_id + test_id, same as the reference
+  // controller's `machineGroups`.
+  final groups = <String, List<Map<String, dynamic>>>{};
+  for (final row in machineRows) {
+    final machineId = row['machine_id']?.toString() ?? '';
+    final testId = row['test_id']?.toString() ?? '';
+    if (machineId.isEmpty || testId.isEmpty) continue;
+    groups.putIfAbsent('${machineId}_$testId', () => []).add(row);
+  }
+
+  final finalResult = <Map<String, dynamic>>[];
+
+  for (final rows in groups.values) {
+    rows.sort((a, b) {
+      final ta = _asDateTime(a['created_at']);
+      final tb = _asDateTime(b['created_at']);
+      if (ta == null && tb == null) return 0;
+      if (ta == null) return -1;
+      if (tb == null) return 1;
+      return ta.compareTo(tb);
+    });
+
+    for (int i = 0; i < rows.length - 1; i++) {
+      final current = rows[i];
+      final next = rows[i + 1];
+      if (current['status'] != 1 || next['status'] != 0) continue;
+
+      final onTime = _asDateTime(current['created_at']);
+      final offTime = _asDateTime(next['created_at']);
+      if (onTime == null || offTime == null) continue;
+
+      // Scope to sessions that STARTED inside the requested date range —
+      // same convention fetchSensorDataInRange uses for its `matched` list.
+      if (onTime.isBefore(from) || onTime.isAfter(to)) continue;
+
+      final sensorRows = allSensorRows.where((row) {
+        final t = _sensorTimestamp(row);
+        if (t == null) return false;
+        return !t.isBefore(onTime) && !t.isAfter(offTime);
+      }).toList();
+      if (sensorRows.isEmpty) continue;
+
+      final runDuration = _analysisRunDuration(onTime, offTime);
+      final ambientTemp = _analysisNum(sensorRows.first['amb_temp']);
+      final finalAmbientTemp = _analysisNum(sensorRows.last['amb_temp']);
+
+      final intervalData = <String, List<Map<String, dynamic>>>{};
+      for (final interval in _analysisIntervals) {
+        intervalData[interval['key'] as String] =
+            _generateAnalysisIntervalData(sensorRows, onTime, offTime, interval['minutes'] as int);
+      }
+
+      final report = <String, dynamic>{};
+
+      for (final field in _analysisFields) {
+        final fieldKey = field['key']!;
+        final fieldName = field['name']!;
+        final finalTemp = _analysisNum(sensorRows.last[fieldKey]);
+
+        if (finalTemp <= 0) {
+          final intervals = <String, dynamic>{
+            for (final interval in _analysisIntervals)
+              (interval['key'] as String): _incompleteIntervalReport((interval['limit'] as num).toDouble()),
+          };
+          report[fieldKey] = {
+            "sensor": fieldName,
+            "ambientTemp": ambientTemp,
+            "finalAmbientTemp": finalAmbientTemp,
+            "finalTemp": 0,
+            "tempRaise": 0,
+            "runDuration": runDuration,
+            "intervals": intervals,
+          };
+          continue;
+        }
+
+        final tempRaise = double.parse((finalTemp - finalAmbientTemp).toStringAsFixed(2));
+        final intervals = <String, dynamic>{};
+
+        final oneHourBefore = offTime.subtract(const Duration(hours: 1));
+        final firstRecord = _nearestSensorRecord(sensorRows, oneHourBefore);
+        final lastRecord = _nearestSensorRecord(sensorRows, offTime);
+
+        for (final interval in _analysisIntervals) {
+          final intervalKey = interval['key'] as String;
+          final limit = (interval['limit'] as num).toDouble();
+
+          if (firstRecord == null || lastRecord == null) {
+            intervals[intervalKey] = _incompleteIntervalReport(limit);
+            continue;
+          }
+
+          final firstTemp = _analysisNum(firstRecord[fieldKey]);
+          final lastTemp = _analysisNum(lastRecord[fieldKey]);
+          final difference = double.parse((lastTemp - firstTemp).toStringAsFixed(2));
+
+          intervals[intervalKey] = {
+            "firstTemperature": firstTemp,
+            "lastTemperature": lastTemp,
+            "temperatureRiseLastOneHour": difference,
+            "threshold": limit,
+            "status": _analysisMotorStatus(difference, limit),
+            "readings": intervalData[intervalKey]!
+                .where((r) => _analysisNum(r[fieldKey]) > 0)
+                .map((r) => {
+                      "time": _sensorTimestamp(r)?.toIso8601String(),
+                      "value": _analysisNum(r[fieldKey]),
+                    })
+                .toList(),
+          };
+        }
+
+        report[fieldKey] = {
+          "sensor": fieldName,
+          "ambientTemp": ambientTemp,
+          "finalAmbientTemp": finalAmbientTemp,
+          "finalTemp": finalTemp,
+          "tempRaise": tempRaise,
+          "runDuration": runDuration,
+          "intervals": intervals,
+        };
+      }
+
+      finalResult.add({
+        "machine_type": current['motor_type'],
+        "machine_id": current['machine_id'],
+        "test_id": current['test_id'],
+        "operation_name": current['operation_name'],
+        "on_time": onTime.toIso8601String(),
+        "off_time": offTime.toIso8601String(),
+        "run_duration": runDuration,
+        "report": report,
+      });
+    }
+  }
+
+  return finalResult;
+}
+
+// ==========================================
+// 6. MAIN SERVICE DRIVER Entrypoint
 // ==========================================
 Future<void> main() async {
   await connectDB();
@@ -6425,6 +7378,7 @@ Future<void> main() async {
       final logs = await fetchSensorDataFromDB();
       return Response.ok(jsonEncode(logs), headers: {"Content-Type": "application/json"});
     } catch (e) {
+      print("[/get-sensor-data] Failed: $e");
       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
     }
   });
@@ -6434,6 +7388,7 @@ Future<void> main() async {
       final logs = await fetchVfdDataFromDB();
       return Response.ok(jsonEncode(logs), headers: {"Content-Type": "application/json"});
     } catch (e) {
+      print("[/get-vfd-data] Failed: $e");
       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
     }
   });
@@ -6528,6 +7483,37 @@ Future<void> main() async {
       return Response.ok(jsonEncode(result), headers: {"Content-Type": "application/json"});
     } catch (e) {
       return Response.internalServerError(body: jsonEncode({"message": e.toString()}));
+    }
+  });
+
+  router.get('/get-machine-analysis', (Request request) async {
+    try {
+      final fromStr = request.url.queryParameters['from'] ?? '';
+      final toStr = request.url.queryParameters['to'] ?? '';
+      if (fromStr.isEmpty || toStr.isEmpty) {
+        return Response(400, body: jsonEncode({"message": "from and to (YYYY-MM-DD) are required"}), headers: {"Content-Type": "application/json"});
+      }
+
+      DateTime parseDay(String s, {required bool endOfDay}) {
+        final parts = s.split('-').map(int.parse).toList();
+        return endOfDay
+            ? DateTime.utc(parts[0], parts[1], parts[2], 23, 59, 59, 999)
+            : DateTime.utc(parts[0], parts[1], parts[2]);
+      }
+
+      final from = parseDay(fromStr, endOfDay: false);
+      final to = parseDay(toStr, endOfDay: true);
+
+      final result = await fetchMachineAnalysisInRange(from, to);
+      return Response.ok(
+        jsonEncode({"success": true, "count": result.length, "data": result}),
+        headers: {"Content-Type": "application/json"},
+      );
+    } catch (e) {
+      return Response.internalServerError(
+        body: jsonEncode({"success": false, "message": e.toString()}),
+        headers: {"Content-Type": "application/json"},
+      );
     }
   });
 
